@@ -5,6 +5,12 @@
 #include <memory>
 #include <sstream>
 #include <string.h>
+#include <atomic>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <zmq.hpp> //apt install libzmq3-dev cppzmq-dev
 
 #include <math.h>
 #include <unistd.h>
@@ -85,6 +91,13 @@ static const char * help =
 "  -planes UINT          Number of planes/ports per NIC.\n"
 "                        Choices: 1..8\n"
 "                        Default: 1\n"
+"  -sa                   Scale-Across Simulation\n"
+"  -ds                   file descriptor of Datacenter in SA simulation\n"
+"                        Must be used with -sa\n"
+"  -id NUM               Specifies the datacenter identifier for Scale Across simulation\n"
+"  -range NUM1 NUM2      Parameter for SA simulation that indicates the range of nodes for one Datacenter\n"
+"  -delay US             Initial delay of the simulation\n"
+"                        Raccomanded in Scale Across simulation\n"
 "  -receiver_cc_only     Enable receiver based Congestion Control Only.\n"
 "                        Default: False\n"
 "  -sender_cc_only       Enable sender based Congestion Control Only.\n"
@@ -199,8 +212,893 @@ uint32_t calculate_bdp_pkt(FatTreeTopologyCfg* t_cfg, linkspeed_bps host_linkspe
     return bdp_pkt;
 }
 
+//SA FUNCTION AND CLASS
+// Custom StreamBuffer che aggiunge il prefisso
+
+class PrefixedBuffer : public std::streambuf {
+private:
+    std::streambuf* dest;
+    std::string prefix;
+    bool at_line_start = true;
+
+protected:
+    // Intercetta l'uscita carattere per carattere
+    int_type overflow(int_type c) override {
+        if (c == traits_type::eof()) {
+            return traits_type::not_eof(c);
+        }
+
+        // Se siamo all'inizio di una riga, stampiamo il prefisso
+        if (at_line_start && !prefix.empty()) {
+            dest->sputn(prefix.data(), prefix.size());
+            at_line_start = false;
+        }
+
+        // Se stampiamo un newline, la prossima volta saremo di nuovo all'inizio
+        if (c == '\n') {
+            at_line_start = true;
+        }
+
+        return dest->sputc(static_cast<char>(c));
+    }
+
+    int sync() override {
+        return dest->pubsync();
+    }
+
+public:
+    PrefixedBuffer(std::streambuf* dest_buf, const std::string& pref)
+        : dest(dest_buf), prefix(pref) {}
+};
+
+// Helper RAII per gestire reindirizzamento e ripristino automatico
+class StreamPrefixer {
+private:
+    std::ostream& stream;
+    std::streambuf* old_buf;
+    PrefixedBuffer new_buf;
+
+public:
+    StreamPrefixer(std::ostream& os, const std::string& prefix)
+        : stream(os), old_buf(os.rdbuf()), new_buf(old_buf, prefix) {
+        stream.rdbuf(&new_buf); // Reindirizza il buffer dello stream
+    }
+
+    ~StreamPrefixer() {
+        stream.rdbuf(old_buf); // Ripristina il buffer originale alla fine dello scope
+    }
+};
+
+
+
+#define TIMEOUT 10
+
+std::atomic<bool> fatal_error_detected(false);
+vector<pid_t> pids;
+
+void handle_sigchld(int sig) {
+    int status;
+    pid_t pid;
+    
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        bool exited_normally = WIFEXITED(status);
+        int exit_code = exited_normally ? WEXITSTATUS(status) : -1;
+
+        if (!exited_normally || exit_code != EXIT_SUCCESS) {
+            const char* err = "[GUIDE_ERROR] CRITIC ERROR: Child died unexpectedly.\n";
+            write(STDERR_FILENO, err, strlen(err));
+            
+            fatal_error_detected.store(true);
+        }
+    }
+}
+
+void kill_all_children() {
+    cerr << "Killing all childs"<< endl;
+    for (pid_t pid : pids) {
+        kill(pid, SIGKILL); 
+    }
+}
+
+void err_guide_routine(){
+    kill_all_children();
+    cerr << "Simulation interrupted with an error." << endl;
+
+    exit(EXIT_FAILURE);
+}
+
+std::vector<std::string> split(const std::string& str, char delimiter) {
+    std::vector<std::string> tokens;
+    std::string token;
+    std::stringstream ss(str);
+    
+    while (std::getline(ss, token, delimiter)) {
+        tokens.push_back(token);
+    }
+    
+    return tokens;
+}
+
+struct EventHeaderUpdater {
+    int child_id;
+    char message[16];
+    simtime_picosec next_event_time;
+};
+
+struct EventTimeLimit{
+    char message[16];
+    simtime_picosec time_limit;
+};
+
+struct ChildEvent {
+    int id;
+    simtime_picosec next_event_time;
+
+    bool operator<(const ChildEvent& other) const {
+        if (next_event_time != other.next_event_time) {
+            return next_event_time < other.next_event_time;
+        }
+        return id < other.id;
+    }
+};
+
+struct Range{
+    long int init;
+    long int fin;
+};
+
+struct RangeMessage{
+    int id;
+    char message[16];
+    Range range;
+};
+
+bool asIntersection(const std::vector<RangeMessage>& rangeSet) {
+    if (rangeSet.size() < 2) return false;
+
+    std::vector<RangeMessage> sortedRanges = rangeSet;
+
+    std::sort(sortedRanges.begin(), sortedRanges.end(), 
+        [](const RangeMessage& a, const RangeMessage& b) {
+            return a.range.init < b.range.init;
+        }
+    );
+
+    for (size_t i = 1; i < sortedRanges.size(); ++i) {
+        if (sortedRanges[i].range.init <= sortedRanges[i - 1].range.fin) {
+            std::cout << sortedRanges[i].id << " and " << sortedRanges[i - 1].id << " overlap!" << std::endl;
+            return true;
+        }
+    }
+
+    //i prefer O(O(Nlog(N)) + O(N)) to O(N^2)
+
+    return false;
+}
+
+int calcTotNodes(const std::vector<RangeMessage>& rangeSet){
+    int ris = 0;
+    auto i = rangeSet.begin();
+
+    for (; i != rangeSet.end(); ++i) {
+        if(strcmp(i->message, "RANGED") == 0){
+            ris += i->range.fin - i->range.init + 1;
+        }else if(strcmp(i->message, "NODES") == 0){
+            ris += i->range.init;
+        }else{ //YOUDO
+            //nothing
+        }
+    }
+
+    return ris;
+}
+
+bool loadDistribution(std::vector<RangeMessage> &rangeVector, int rangeMax){
+    if(calcTotNodes(rangeVector) > rangeMax) return false;
+
+    vector<RangeMessage> ranged;
+    vector<RangeMessage> nodes;
+    vector<RangeMessage> youDo;
+
+    for(const auto range: rangeVector){
+        if(strcmp(range.message, "YOUDO") == 0)
+            youDo.push_back(range);
+        else if(strcmp(range.message, "NODES") == 0)
+            nodes.push_back(range);
+        else if(strcmp(range.message, "RANGED") == 0)
+            ranged.push_back(range);
+        else
+            return false;
+    }
+    
+    if(asIntersection(ranged)){
+        cerr<<"Overlapped ranges"<<endl;
+        return false;
+    }
+
+    int nodesLeft = rangeMax;
+    vector<Range> gaps;
+    gaps.push_back({0, rangeMax - 1});
+
+    //now we are going to manage the load of DC in specification order
+
+    //ranged (we know the number of nodes and what nodes we need)
+    for(auto &range: ranged){
+        long int fin = range.range.fin, 
+                 init = range.range.init;
+
+        if(fin >= rangeMax || init < 0){
+            cerr<<"Range DC"<<range.id<<" out of legal range"<<endl;
+            return false;
+        }
+        
+        nodesLeft -= fin - init + 1;
+        // we can avoid the check because of initial check with calcTotNodes
+        //if(nodesLeft < 0) return false;
+        
+        for (size_t i = 0; i < gaps.size(); ++i) {
+            Range &gap = gaps[i];
+            if(gap.init > fin || gap.fin < init) continue;
+
+            if (gap.init == init && gap.fin == fin) {
+                std::swap(gap, gaps.back());
+                gaps.pop_back();
+            }else if (gap.init == init && gap.fin > fin) {
+                gap.init = fin + 1;
+            }else if (gap.init < init && gap.fin == fin) {
+                gap.fin = init - 1;
+            }else if (gap.init < init && gap.fin > fin) {
+                int tempFin = gap.fin;
+                gap.fin = init - 1;
+                gaps.push_back({fin + 1, tempFin});
+            }else{
+                cerr<<"i'm not suppose to be here lol"<<endl;
+                return false;
+            }
+
+            break;
+        }
+    }
+
+    
+    //nodes (we know only the number of nodes ctrictly needed)
+    for(auto &node: nodes){
+        long int n = node.range.init;
+        nodesLeft -= n;
+        
+        int bestIdx = -1;
+        int minRemaining = rangeMax + 1;
+
+        for (size_t i = 0; i < gaps.size(); ++i) {
+            int gapNodes = gaps[i].fin - gaps[i].init + 1;
+            if (gapNodes >= n) {
+                int remaining = gapNodes - n;
+                if (remaining < minRemaining) { //best fit
+                    minRemaining = remaining;
+                    bestIdx = i;
+                    if (remaining == 0) break; // perfect fit!
+                }
+            }
+        }
+
+        if (bestIdx == -1) {
+            cerr << "Nodes DC" << node.id << " without an available Range" << endl;
+            return false;
+        }
+
+        Range &chosenGap = gaps[bestIdx];
+        node.range = {chosenGap.init, chosenGap.init + n - 1};
+
+        if (chosenGap.fin - chosenGap.init + 1 == n) {
+            std::swap(gaps[bestIdx], gaps.back());
+            gaps.pop_back();
+        } else {
+            chosenGap.init += n;
+        }
+    }
+
+    if(youDo.size() > nodesLeft){
+        cerr<<"there is no nodes left for the self handled datacenter"<<endl;
+        return false;
+    }
+
+    //youdo
+
+    //to do...
+    if(youDo.size() > 0){
+        cerr<<"YouDo is not currently handled."<<endl;
+        return false;
+    }
+
+    if(!gaps.empty()){
+        cerr<<"There is some gaps left after load distribution"<<endl;
+        cerr<<"Remaining gaps: "<<endl;
+        for(const auto gap: gaps){
+            cout<<"["<<gap.init<<","<<gap.fin<<"], ";
+        }
+        cout<<endl;
+        return false;
+    }
+
+
+    rangeVector.clear();
+    rangeVector.insert(rangeVector.end(), ranged.begin(), ranged.end());
+    rangeVector.insert(rangeVector.end(), nodes.begin(), nodes.end());
+    rangeVector.insert(rangeVector.end(), youDo.begin(), youDo.end());
+
+    return true;
+}
+
+
+
+string endpoint = "ipc:///tmp/datacenter_guide.ipc";
+
 int main(int argc, char **argv) {
-    Clock c(timeFromSec(5 / 100.), eventlist);
+    int i = 1;
+    int ppid = 0;
+
+    int process = 0;
+
+    bool sa = false;
+    
+    zmq::context_t context(1);
+    zmq::socket_t socket(context, zmq::socket_type::req);
+    zmq::message_t resp;
+    //check if this is a Scale-Across simulation
+    if(!strcmp(argv[i],"-sa")){
+        i++;
+        sa = true;
+
+        if(!strcmp(argv[i],"-dc")){ //i'm the father (GUIDE)
+            string dcPath = argv[i++];
+            
+            //getting dc info.
+
+            ppid = getpid();
+
+            int countDC = 4;
+
+            char tm[128] = "./connection_matrices/perm_128n_128c_2MB.cm\0";
+            std::vector<std::vector<std::string>> dcArgs = {
+                {
+                    argv[0],
+                    "-sa", std::to_string(ppid),
+                    //"-tm", "./connection_matrices/a2a.cm"
+                    "-tm", tm,
+                    "-range", "16", "69",
+                    "-id", "0"
+                },
+                {
+                    argv[0],
+                    "-sa", std::to_string(ppid),
+                    //"-tm", "./connection_matrices/perm_128n_128c_2MB.cm"
+                    "-tm", tm,
+                    "-nodes", "16",
+                    "-id", "1"
+                },
+                {
+                    argv[0],
+                    "-sa", std::to_string(ppid),
+                    //"-tm", "./connection_matrices/perm_16n_16c_2MB.cm"
+                    "-tm", tm,
+                    "-nodes", "54",
+                    "-id", "2"
+                },
+                {
+                    argv[0],
+                    "-sa", std::to_string(ppid),
+                    "-tm", tm,
+                    "-range", "124", "177",
+                    "-id", "3"
+                }
+            };
+
+            //creation of signal listener of the Childs
+            struct sigaction sa;
+            sa.sa_handler = handle_sigchld;
+            sigemptyset(&sa.sa_mask);
+            sa.sa_flags = SA_RESTART | SA_NOCLDSTOP;
+            sigaction(SIGCHLD, &sa, NULL);
+
+            //creation of the childs
+
+            for (const auto& dc : dcArgs) {
+
+                pid_t pid = fork();
+                pids.push_back(pid);
+
+                if (pid == 0) {
+                    //child
+
+                    std::vector<char*> args;
+
+                    for (const auto& arg : dc) {
+                        args.push_back(const_cast<char*>(arg.c_str()));
+                    }
+
+                    args.push_back(nullptr);
+
+                    execv(args[0], args.data());
+
+                    cerr<<"[CHILD] ERROR TO CREATE THE PROCESS. shutting down...";
+                    exit(EXIT_FAILURE);
+                }
+
+                if (pid < 0) {
+                    cerr<<"[GUIDE] ERROR TO GENERATE A CHILD"<<endl;
+
+                    err_guide_routine();
+                }
+            }
+
+            StreamPrefixer p1(std::cout, "[GUIDE] ");
+            StreamPrefixer p2(std::cerr, "[GUIDE_ERROR] ");
+
+            //creation of the socket ROUTER
+            zmq::context_t context(1);
+            
+            zmq::socket_t guide_socket(context, zmq::socket_type::router);
+            guide_socket.bind(endpoint);
+            cout << "Receiving at " << endpoint << endl;
+
+            zmq::message_t routing_id; // Frame 0: Child ID (socket ZeroMQ)
+            zmq::message_t empty_frame; // Frame 1: Empty Frame (Protocoll REQ/ROUTER)
+            zmq::message_t payload;     // Frame 2: payload
+            
+            //connection with children
+
+            string response;
+            int childCount = 0;
+
+            vector<zmq::message_t> sockets(countDC);
+            vector<bool> usedIds(countDC, false);
+            vector<zmq::message_t> pendingChildren;
+            
+            int timeOut = 0;
+            while (childCount < countDC && !fatal_error_detected.load() && timeOut < TIMEOUT) {
+                try{
+                    zmq::pollitem_t items[] = { { guide_socket.handle(), 0, ZMQ_POLLIN, 0 } };
+
+                    int rc = zmq::poll(items, 1, std::chrono::milliseconds(200));
+
+                    if (rc == 0){
+                        timeOut++;
+                        continue;
+                    }
+                    timeOut = 0;
+
+                    guide_socket.recv(routing_id, zmq::recv_flags::none);
+                    guide_socket.recv(empty_frame, zmq::recv_flags::none);
+                    guide_socket.recv(payload, zmq::recv_flags::none);
+
+                    std::string str(static_cast<char*>(payload.data()), payload.size());
+                    vector<string> data = split(str, ' ');
+                    
+                    if(data[0].compare("ID") != 0){
+                        cerr<<"Unaspected data (ID), shutting down..."<<endl;
+                        err_guide_routine();
+                    }
+                    int id = stoi(data[1]);
+                    if(id != -1){
+                        if (id < 0 || id >= countDC || usedIds[id]) {
+                            cerr << "Invalid or duplicate ID requested: " << id<< endl;
+                            err_guide_routine();
+                        }
+
+                        sockets[id].copy(routing_id);
+                        usedIds[id] = true;
+                    }else{
+                        zmq::message_t temp;
+                        temp.copy(routing_id);
+                        pendingChildren.push_back(move(temp));
+                    }
+
+                    childCount++;
+                }catch(const zmq::error_t& e){
+                    if (e.num() == EINTR) {
+                        // if some child died
+                        if (fatal_error_detected.load()) break;
+                        continue; // false allarm
+                    }
+                    // Actual ZMQ error
+                    cerr << "ZMQ Error: " << e.what() << endl;
+                    fatal_error_detected.store(true);
+                    break;
+                }
+            }
+            if(timeOut == TIMEOUT){
+                cerr<<"Time out"<<endl;
+                err_guide_routine();
+            }
+
+            if(fatal_error_detected.load()) err_guide_routine();
+
+            childCount = 0;
+            int penIdx = 0;
+            for(int j = 0; j<countDC ;j++){
+                if(!usedIds[j]){
+                    sockets[j].copy(pendingChildren[penIdx++]);
+                }
+
+                response = "OK "+to_string(j);
+
+                zmq::message_t route;
+                route.copy(sockets[j]);
+                guide_socket.send(route, zmq::send_flags::sndmore);
+                guide_socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                guide_socket.send(zmq::buffer(response), zmq::send_flags::none);
+            }
+
+            cout<<"All child are memorized and with an identity"<<endl;
+
+            cout<<"Waiting childs nodes for load balancing"<<endl;
+
+            //syncronize the childs TEMP
+            for (pid_t pid : pids) {
+                int status;
+                waitpid(pid, &status, WUNTRACED);
+            }
+            if(fatal_error_detected.load()) err_guide_routine();
+            for (pid_t pid : pids) {
+                kill(pid, SIGCONT);
+            }
+            
+            vector<RangeMessage> childRanges;
+            
+            childCount = 0;
+            while (childCount < countDC && !fatal_error_detected.load() && timeOut < TIMEOUT) {
+                try{
+
+                    zmq::pollitem_t items[] = { { guide_socket.handle(), 0, ZMQ_POLLIN, 0 } };
+
+                    int rc = zmq::poll(items, 1, std::chrono::milliseconds(1000)); //1*TIMEOUT minutes for timeout
+
+                    if (rc == 0){
+                        timeOut++;
+                        continue;
+                    }
+                    timeOut = 0;
+
+                    guide_socket.recv(routing_id, zmq::recv_flags::none);
+                    guide_socket.recv(empty_frame, zmq::recv_flags::none);
+                    guide_socket.recv(payload, zmq::recv_flags::none);
+
+                    if(payload.size() != sizeof(RangeMessage)){
+                        cerr<<"Unaspected data (RangeMessage), shutting down..."<<endl;
+                        err_guide_routine();
+                    }
+
+                    RangeMessage data;
+                    memcpy(&data, payload.data(), sizeof(RangeMessage));
+                    
+                    if(sizeof(data.range) != sizeof(Range)){
+                        cerr<<"Unaspected data (Range), shutting down..."<<endl;
+                        err_guide_routine();
+                    }
+
+                    if(!(sockets[data.id] == routing_id)){
+                        cerr<<"Unaspected sender, shutting down..."<<endl;
+                        err_guide_routine();
+                    }
+
+                    if(strcmp(data.message, "RANGED") == 0){
+                        if(data.range.fin == -1){
+                            cerr<<"Incoerence on Ranged message, shutting down..."<<endl;
+                            err_guide_routine();
+                        }
+                    }else if(strcmp(data.message, "NODES") == 0){
+                        if(data.range.init == 0){
+                            cerr<<"Incoerence on Nodes message, shutting down..."<<endl;
+                            err_guide_routine();
+                        }
+                    }else if(strcmp(data.message, "YOUDO") == 0){
+                        //nothing
+                    }else{
+                        cerr<<"Unaspected message, shutting down..."<<endl;
+                        err_guide_routine();
+                    }
+
+                    childRanges.push_back(data);
+                    childCount++;
+                }catch(const zmq::error_t& e){
+                    if (e.num() == EINTR) {
+                        // if some child died
+                        if (fatal_error_detected.load()) break;
+                        continue; // false allarm
+                    }
+                    // Actual ZMQ error
+                    cerr << "ZMQ Error: " << e.what() << endl;
+                    fatal_error_detected.store(true);
+                    break;
+                }
+            }
+
+            if(timeOut == TIMEOUT){
+                cerr<<"Time out"<<endl;
+                err_guide_routine();
+            }
+
+            if(fatal_error_detected.load()) err_guide_routine();
+
+            for(auto it : childRanges){
+                cout<<"DATACENTER "<<it.id<<": message "<<it.message<<" with range ["<< it.range.init <<", "<< it.range.fin << "]"<<endl;
+            }
+
+            cout<<"Information of nodes and range of all childs acquired... proceeding to do load distribution. "<<endl;
+
+            //Get the tot number of nodes on tm file
+            int totNodes;
+            std::ifstream file(tm);
+            if(file.is_open()){
+                totNodes = ConnectionMatrix::getNumNode(file);
+                file.close();
+            }else{
+                cerr<<"Failed to open file, shutting down..."<<endl;
+                err_guide_routine();
+            }
+
+            if(totNodes%2 != 0){
+                cerr<<"The number of nodes in tm file must be even"<<endl;
+                err_guide_routine();
+            }
+
+            if (!loadDistribution(childRanges, totNodes)){
+                cerr<<"Impossibile Load Distribution, shutting down";
+                err_guide_routine();
+            }
+
+            for(const auto& chiRa: childRanges){
+                zmq::message_t route;
+                route.copy(sockets[chiRa.id]);
+                guide_socket.send(route, zmq::send_flags::sndmore);
+                guide_socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                guide_socket.send(zmq::buffer(&chiRa.range, sizeof(Range)), zmq::send_flags::none);
+            }
+
+            cout<<"Waiting every child initializing their enviroment"<<endl;
+
+            //syncronize the childs TEMP
+            for (pid_t pid : pids) {
+                int status;
+                waitpid(pid, &status, WUNTRACED);
+            }
+            if(fatal_error_detected.load()) err_guide_routine();
+            for (pid_t pid : pids) {
+                kill(pid, SIGCONT);
+            }
+
+            cout<<"INITIALIZE PRE-SIMULATION"<<endl;
+
+            set<ChildEvent> queue_order_childs;
+
+            //INIT
+            childCount = 0;
+            while (childCount < countDC && !fatal_error_detected.load() && timeOut < TIMEOUT) {
+                try{
+
+                    zmq::pollitem_t items[] = { { guide_socket.handle(), 0, ZMQ_POLLIN, 0 } };
+
+                    int rc = zmq::poll(items, 1, std::chrono::milliseconds(60000)); //1*TIMEOUT minutes for timeout
+
+                    if (rc == 0){
+                        timeOut++;
+                        continue;
+                    }
+                    timeOut = 0;
+
+                    guide_socket.recv(routing_id, zmq::recv_flags::none);
+                    guide_socket.recv(empty_frame, zmq::recv_flags::none);
+                    guide_socket.recv(payload, zmq::recv_flags::none);
+
+                    if(payload.size() != sizeof(EventHeaderUpdater)){
+                        cerr<<"Unaspected data, shutting down..."<<endl;
+                        err_guide_routine();
+                    }
+
+                    EventHeaderUpdater data;
+                    memcpy(&data, payload.data(), sizeof(EventHeaderUpdater));
+
+                    if(!(sockets[data.child_id] == routing_id)){
+                        cerr<<"Unaspected sender, shutting down..."<<endl;
+                        err_guide_routine();
+                    }
+
+                    if(strcmp(data.message, "INIT") != 0){
+                        cerr<<"Unaspected message, shutting down..."<<endl;
+                        err_guide_routine();
+                    }
+
+                    queue_order_childs.insert({data.child_id, data.next_event_time});
+
+
+                    childCount++;
+                }catch(const zmq::error_t& e){
+                    if (e.num() == EINTR) {
+                        // if some child died
+                        if (fatal_error_detected.load()) break;
+                        continue; // false allarm
+                    }
+                    // Actual ZMQ error
+                    cerr << "ZMQ Error: " << e.what() << endl;
+                    fatal_error_detected.store(true);
+                    break;
+                }
+            }
+
+            
+            for (const auto& evento : queue_order_childs) {
+                std::cout << "ID: " << evento.id << " | Simtime: " << evento.next_event_time << " ps"<<endl;
+            }
+
+            cout<<"STARTING THE SIMULATION..."<<endl;
+            
+            ChildEvent next, now;
+            now = *queue_order_childs.begin();
+            queue_order_childs.erase(queue_order_childs.begin());
+
+            EventTimeLimit info;
+
+            while (!fatal_error_detected.load()) {
+                if(queue_order_childs.empty()){
+                    strcpy(info.message, "NOLIMIT");
+                }else{
+                    next = *queue_order_childs.begin();
+
+                    strcpy(info.message, "GO");
+                    info.time_limit = next.next_event_time;
+                }
+               
+                zmq::message_t route;
+                route.copy(sockets[now.id]);
+                guide_socket.send(route, zmq::send_flags::sndmore);
+                guide_socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                guide_socket.send(zmq::buffer(&info, sizeof(EventTimeLimit)), zmq::send_flags::none);
+                
+                int rc = 0;
+                timeOut = 0;
+                while (rc == 0 && timeOut < TIMEOUT) {
+                    zmq::pollitem_t items[] = { { guide_socket.handle(), 0, ZMQ_POLLIN, 0 } };
+                    rc = zmq::poll(items, 1, std::chrono::milliseconds(1000));
+                    if (rc == 0) timeOut++;
+                }
+                
+                if(timeOut >= TIMEOUT){
+                    cerr<<"TIMEOUT on CHILD "<<now.id<<endl;
+                    err_guide_routine();
+                }
+                
+
+                guide_socket.recv(routing_id, zmq::recv_flags::none);
+                guide_socket.recv(empty_frame, zmq::recv_flags::none);
+                guide_socket.recv(payload, zmq::recv_flags::none);
+
+                if(routing_id != sockets[now.id]){
+                    cerr<<"Unaspected sender, shutting down..."<<endl;
+                    err_guide_routine();
+                }
+
+                if(payload.size() != sizeof(EventHeaderUpdater)){
+                    cerr<<"Unaspected data, shutting down..."<<endl;
+                    err_guide_routine();
+                }
+
+                EventHeaderUpdater data;
+                memcpy(&data, payload.data(), sizeof(EventHeaderUpdater));
+                
+                if(strcmp(data.message, "UPDATE") == 0){
+                    //cout<<"Mi e' arrivato "<<timeAsUs(data.next_event_time)<<" da "<<data.child_id<<endl;
+                    queue_order_childs.insert({data.child_id, data.next_event_time});
+
+                }else if(strcmp(data.message, "DONE") == 0){
+                    //cout<<"Mi e' arrivato DONE da "<<data.child_id<<endl;
+                }else if(strcmp(data.message, "WAN") == 0){
+                    //TO DO...
+                }else{
+                    cerr<<"Unaspected message, shutting down..."<<endl;
+                    err_guide_routine();
+                }
+
+
+                if(queue_order_childs.empty() && (strcmp(data.message, "DONE") == 0)) //stop simulating
+                    break;
+
+                now = *queue_order_childs.begin();
+                queue_order_childs.erase(queue_order_childs.begin());
+            }
+
+            if(fatal_error_detected.load())err_guide_routine();
+
+            for(auto& id : sockets){
+                strcpy(info.message, "STOP");
+
+                zmq::message_t route;
+                route.copy(id);
+                guide_socket.send(route, zmq::send_flags::sndmore);
+                guide_socket.send(zmq::message_t(), zmq::send_flags::sndmore);
+                guide_socket.send(zmq::buffer(&info, sizeof(EventTimeLimit)), zmq::send_flags::none);
+            }
+
+            cout << "Simulation as ended, waiting all child to terminate..." << endl;
+
+            for (pid_t pid : pids) {
+                if (pid <= 0) continue;
+
+                int status;
+                pid_t result;
+
+                do {
+                    result = waitpid(pid, &status, 0);
+                } while (result == -1 && errno == EINTR);
+            }
+
+            cout << "All children have terminated. Exiting." << endl;
+            exit(EXIT_SUCCESS);
+
+        }else{ //i'm the child
+            int temp = getppid();
+            ppid = atoi(argv[i++]);
+
+            cout<<"[CHILD] ACTUAL_PPID: "<<temp<<", AXPECTED_PPID: "<<ppid<<", i: "<<i<<endl;
+            
+            if(temp != ppid){
+                exit(EXIT_FAILURE);
+            }
+
+            //connection to father with socket REQ
+            socket.connect(endpoint);
+
+            cout<<"[CHILD] Connected on GUIDE at: " << endpoint << endl;
+
+            //setup the 
+            string send;
+
+            send = "ID -1";
+            int j = 1;
+            while(j<argc){
+                if(!strcmp(argv[j],"-id")){
+                    process = atoi(argv[++j]);
+                    send = "ID "+to_string(process);
+                    break;
+                }
+                j++;
+            }
+
+
+            socket.send(zmq::buffer(send), zmq::send_flags::none);
+
+            socket.recv(resp, zmq::recv_flags::none);
+
+            vector<string> words = split(resp.to_string(), ' ');
+
+            if(words[0].compare("OK")){
+                cerr<<"[CHILD] Unaspected message, shutting down..."<<endl;
+                exit(EXIT_FAILURE);
+            }
+
+            process = stoi(words[1]);
+            cout<<"[CHILD "<<process<<"] Information aquired, i'm the child number: "<< process << endl;
+        }
+    }
+
+    //exit(EXIT_SUCCESS);
+    
+    Range range;
+    range.init = 0;
+    range.fin = -1;
+    
+    string prefix = "";
+
+    if(sa)
+        prefix = "[DATACENTER "+to_string(process)+"] ";
+
+    StreamPrefixer p1(std::cout, prefix.c_str());
+
+    if(sa)
+        prefix = "[DATACENTER_ERROR "+to_string(process)+"] ";
+
+    StreamPrefixer p2(std::cerr, prefix.c_str());
+
+    //Clock c(timeFromSec(5 / 100.), eventlist);
     bool param_queuesize_set = false;
     uint32_t queuesize_pkt = 0;
     linkspeed_bps linkspeed = speedFromMbps((double)HOST_NIC);
@@ -246,7 +1144,6 @@ int main(int argc, char **argv) {
     RouteStrategy route_strategy = NOT_SET;
     
     int seed = 13;
-    int i = 1;
     double pcie_rate = 1.1;
 
     filename << "logout.dat";
@@ -266,7 +1163,30 @@ int main(int argc, char **argv) {
     bool conn_reuse = false;
 
     while (i<argc) {
-        if (!strcmp(argv[i],"-o")) {
+        if ((!strcmp(argv[i],"-sa")) || (!strcmp(argv[i],"-dc")) ){
+            cerr<<"The Scale Across flags must be on the first input as follows: -sa -dc ./file"<<endl;
+            exit(EXIT_FAILURE);
+        }else if (!strcmp(argv[i],"-id")){
+            if(!sa){
+                cerr<<"id can be used only in a Scale Across simulation"<<endl;
+                exit(EXIT_FAILURE);
+            }
+            i+=2;
+        }else if (!strcmp(argv[i],"-range")) {
+            if(sa){
+                range.init = atoi(argv[++i]);
+                range.fin  = atoi(argv[++i]);
+                if(range.init > range.fin){
+                    cerr<<"Invalid range input"<<endl;
+                    exit(EXIT_FAILURE);
+                }
+                cout<<"Range setted to ["<< range.init << ","<< range.fin <<"]"<<endl;
+
+            }else{
+                cerr<<"Range parameter is for Scale across simulation only"<<endl;
+                exit(EXIT_FAILURE);
+            }
+        }else if (!strcmp(argv[i],"-o")) {
             filename.str(std::string());
             filename << argv[i+1];
             i++;
@@ -643,7 +1563,8 @@ int main(int argc, char **argv) {
             exit_error(argv[0]);
         } else {
             cout << "Unknown parameter " << argv[i] << endl;
-            exit_error(argv[0]);
+            //exit_error(argv[0]);
+            exit(EXIT_FAILURE);
         }
         i++;
     }
@@ -752,27 +1673,131 @@ int main(int argc, char **argv) {
         qlf->set_sample_period(logtime);
     }
 
-    auto conns = std::make_unique<ConnectionMatrix>(no_of_nodes);
 
-    if (tm_file){
-        cout << "Loading connection matrix from  " << tm_file << endl;
+    unique_ptr<FatTreeTopologyCfg> topo_cfg;
+    auto conns = make_unique<ConnectionMatrix>(no_of_nodes);
 
-        if (!conns->load(tm_file)){
-            cout << "Failed to load connection matrix " << tm_file << endl;
-            exit(-1);
+    if(sa){
+        //sync all child TEMP
+        raise(SIGSTOP);
+
+        //initial configuration of topography
+
+        if(topo_file && no_of_nodes != 0){
+            cerr<<"Only one input is allowed between -topo and -node"<<endl;
+            exit(EXIT_FAILURE);
+        }
+        if(topo_file){
+            topo_cfg = FatTreeTopologyCfg::load(topo_file, memFromPkt(queuesize_pkt), qt, snd_type);
+            
+            if (range.fin != -1){
+                if(topo_cfg->no_of_nodes() != range.fin - range.init + 1){
+                    cerr<<"range input and topo file are incompatibles for node numbers"<<endl;
+                    exit(EXIT_FAILURE);
+                }
+            }
+
+            no_of_nodes = topo_cfg->no_of_nodes();
+        }else if(no_of_nodes != 0 || range.fin != -1){
+            if(no_of_nodes == 0){
+                no_of_nodes = range.fin - range.init + 1;
+            }
+            if (range.fin != -1){
+                if(no_of_nodes != range.fin - range.init + 1){
+                    cerr<<"input range and nodes are incompatibles"<<endl;
+                    exit(EXIT_FAILURE);
+                }
+            }
+
+            topo_cfg = make_unique<FatTreeTopologyCfg>(tiers, no_of_nodes, linkspeed, memFromPkt(queuesize_pkt),
+                                                hop_latency, switch_latency, 
+                                                qt, snd_type);
+        }else{
+            cout<<"I don't know my range and nodes"<<endl;
+        }
+
+        //getting node range
+        RangeMessage msgRange;
+        msgRange.id = process;
+        msgRange.range = range;
+        if(no_of_nodes != 0){
+            if(range.fin != -1){
+                strcpy(msgRange.message, "RANGED");
+            }else{
+                strcpy(msgRange.message, "NODES");
+                msgRange.range.init = no_of_nodes;
+            }
+        }else{
+            strcpy(msgRange.message, "YOUDO");
+        }
+        socket.send(zmq::buffer(&msgRange, sizeof(RangeMessage)), zmq::send_flags::none);
+
+        socket.recv(resp, zmq::recv_flags::none);
+        memcpy(&range, resp.data(), sizeof(Range));
+
+        if(no_of_nodes == 0){
+            no_of_nodes = range.fin - range.init + 1;
+            topo_cfg = make_unique<FatTreeTopologyCfg>(tiers, no_of_nodes, linkspeed, memFromPkt(queuesize_pkt),
+                                                hop_latency, switch_latency, 
+                                                qt, snd_type);
+        }
+
+        cout<<"I manage "<< no_of_nodes << " nodes in range ["<< range.init <<", "<< range.fin <<"]"<<endl;
+
+        if (tm_file){
+            cout << "Loading connection matrix from  " << tm_file << endl;
+
+            if (!conns->load(tm_file)){
+                cout << "Failed to load connection matrix " << tm_file << endl;
+                exit(EXIT_FAILURE);
+            }
+        }
+        else {
+            cout << "Loading connection matrix from standard input" << endl;        
+            conns->load(cin);
+        }
+    
+
+    }else{ //not a Scale across simulation
+        if (tm_file){
+            cout << "Loading connection matrix from  " << tm_file << endl;
+
+            if (!conns->load(tm_file)){
+                cout << "Failed to load connection matrix " << tm_file << endl;
+                exit(EXIT_FAILURE);
+            }
+        }
+        else {
+            cout << "Loading connection matrix from standard input" << endl;        
+            conns->load(cin);
+        }
+
+        if (conns->N != no_of_nodes && no_of_nodes != 0){
+            cout << "Connection matrix number of nodes is " << conns->N << " while I am using " << no_of_nodes << endl;
+            exit(EXIT_FAILURE);
+        }
+
+        no_of_nodes = conns->N;
+    
+        if (topo_file) {
+            topo_cfg = FatTreeTopologyCfg::load(topo_file, memFromPkt(queuesize_pkt), qt, snd_type);
+
+            if (topo_cfg->no_of_nodes() != no_of_nodes) {
+                cerr << "Mismatch between connection matrix (" << no_of_nodes << " nodes) and topology ("
+                        << topo_cfg->no_of_nodes() << " nodes)" << endl;
+                exit(EXIT_FAILURE);
+            }
+        } else {
+            topo_cfg = make_unique<FatTreeTopologyCfg>(tiers, no_of_nodes, linkspeed, memFromPkt(queuesize_pkt),
+                                                    hop_latency, switch_latency, 
+                                                    qt, snd_type);
         }
     }
-    else {
-        cout << "Loading connection matrix from  standard input" << endl;        
-        conns->load(cin);
-    }
 
-    if (conns->N != no_of_nodes && no_of_nodes != 0){
-        cout << "Connection matrix number of nodes is " << conns->N << " while I am using " << no_of_nodes << endl;
-        exit(-1);
-    }
 
-    no_of_nodes = conns->N;
+    
+
+
 
     if (!param_queuesize_set) {
         cout << "Automatic queue sizing enabled ";        
@@ -787,21 +1812,6 @@ int main(int argc, char **argv) {
         }
         cout << " queue-size-to-bdp-factor is " << queue_size_bdp_factor << "xBDP"
              << endl;
-    }
-
-    unique_ptr<FatTreeTopologyCfg> topo_cfg;
-    if (topo_file) {
-        topo_cfg = FatTreeTopologyCfg::load(topo_file, memFromPkt(queuesize_pkt), qt, snd_type);
-
-        if (topo_cfg->no_of_nodes() != no_of_nodes) {
-            cerr << "Mismatch between connection matrix (" << no_of_nodes << " nodes) and topology ("
-                    << topo_cfg->no_of_nodes() << " nodes)" << endl;
-            exit(1);
-        }
-    } else {
-        topo_cfg = make_unique<FatTreeTopologyCfg>(tiers, no_of_nodes, linkspeed, memFromPkt(queuesize_pkt),
-                                                   hop_latency, switch_latency, 
-                                                   qt, snd_type);
     }
 
     simtime_picosec network_max_unloaded_rtt = calculate_rtt(topo_cfg.get(), linkspeed);
@@ -858,14 +1868,18 @@ int main(int argc, char **argv) {
     }
     cout << "network_max_unloaded_rtt " << timeAsUs(network_max_unloaded_rtt) << endl;
 
-    if (UecSink::_oversubscribed_cc)
+    if (UecSink::_oversubscribed_cc){
         OversubscribedCC::_base_rtt = network_max_unloaded_rtt;
-
+    }
     
     //handle link failures specified in the connection matrix.
     for (size_t c = 0; c < conns->failures.size(); c++){
         failure* crt = conns->failures.at(c);
-
+        
+        if(sa){
+            if(crt->dc != process) continue;
+        }
+        
         cout << "Adding link failure switch type" << crt->switch_type << " Switch ID " << crt->switch_id << " link ID "  << crt->link_id << endl;
         // xxx we only support failures in plane 0 for now.
         topo[0]->add_failed_link(crt->switch_type,crt->switch_id,crt->link_id);
@@ -917,138 +1931,315 @@ int main(int argc, char **argv) {
     }
 
     mem_b cwnd_b = cwnd*Packet::data_packet_size();
-    for (size_t c = 0; c < all_conns->size(); c++){
-        connection* crt = all_conns->at(c);
-        int src = crt->src;
-        int dest = crt->dst;
 
-        if (!conn_reuse and crt->msgid.has_value()) {
-            cout << "msg keyword can only be used when conn_reuse is enabled.\n";
-            abort();
-        }
+    if(sa){
+        // ---- hardcoded flow 1->2 ----  
+        int src = 0;  
+        int dest = 16;  
+        
+        simtime_picosec transmission_delay =  
+            (Packet::data_packet_size() * 8 / speedAsGbps(linkspeed) * topo_cfg->get_diameter() * 1000)  
+            + (UecBasePacket::get_ack_size() * 8 / speedAsGbps(linkspeed) * topo_cfg->get_diameter() * 1000);  
+        simtime_picosec base_rtt_bw_two_points =  
+            2 * topo_cfg->get_two_point_diameter_latency(src, dest) + transmission_delay;  
+        
+        // 1. multipath  
+        unique_ptr<UecMultipath> mp = nullptr;  
+        if (load_balancing_algo == BITMAP)  
+            mp = make_unique<UecMpBitmap>(path_entropy_size, UecSrc::_debug);  
+        else if (load_balancing_algo == REPS)  
+            mp = make_unique<UecMpReps>(path_entropy_size, UecSrc::_debug, !disable_trim);  
+        else if (load_balancing_algo == OBLIVIOUS)  
+            mp = make_unique<UecMpOblivious>(path_entropy_size, UecSrc::_debug);  
+        else if (load_balancing_algo == MIXED)  
+            mp = make_unique<UecMpMixed>(path_entropy_size, UecSrc::_debug);  
+        else { cout << "ERROR: multipath\n"; abort(); }  
+        
+        // 2. src e sink  
+        UecSrc* uec_src = new UecSrc(traffic_logger, eventlist, move(mp), *nics.at(src), ports);  
+        UecSink* uec_snk;  
+        if (receiver_driven)  
+            uec_snk = new UecSink(NULL, pacers[dest].get(), *nics.at(dest), ports);  
+        else  
+            uec_snk = new UecSink(NULL, linkspeed, 1.1,  
+                UecBasePacket::unquantize(UecSink::_credit_per_pull), eventlist, *nics.at(dest), ports);  
+        
+        // 3. inizializzazione CC  
+        if (receiver_driven)  
+            uec_src->initRccc(cwnd_b, enable_accurate_base_rtt ? base_rtt_bw_two_points : network_max_unloaded_rtt);  
+        if (sender_driven)  
+            uec_src->initNscc(cwnd_b, enable_accurate_base_rtt ? base_rtt_bw_two_points : network_max_unloaded_rtt);  
+        
+        uec_srcs.push_back(uec_src);  
+        uec_src->setDst(dest);  
+        uec_src->setName("Uec_1_2");  
+        logfile.writeName(*uec_src);  
+        uec_snk->setSrc(src);  
+        flowmap[uec_src->flowId()] = { uec_src, uec_snk };  
+        ((DataReceiver*)uec_snk)->setName("Uec_sink_1_2");  
+        logfile.writeName(*(DataReceiver*)uec_snk);  
+        
+        if (UecSink::_model_pcie)      uec_snk->setPCIeModel(pcie_models[dest]);  
+        if (UecSink::_oversubscribed_cc) uec_snk->setOversubscribedCC(oversubscribed_ccs[dest]);  
+        
+        uec_src->setFlowsize(2000000);   // size del flusso in byte  
+        
+        // 4. route + registrazione sui ToR  
+        for (uint32_t p = 0; p < planes; p++) {  
+            Route* srctotor = new Route();  
+            srctotor->push_back(topo[p]->queues_ns_nlp[src][topo_cfg->HOST_POD_SWITCH(src)][0]);  
+            srctotor->push_back(topo[p]->pipes_ns_nlp[src][topo_cfg->HOST_POD_SWITCH(src)][0]);  
+            srctotor->push_back(topo[p]->queues_ns_nlp[src][topo_cfg->HOST_POD_SWITCH(src)][0]->getRemoteEndpoint());  
+        
+            Route* dsttotor = new Route();  
+            dsttotor->push_back(topo[p]->queues_ns_nlp[dest][topo_cfg->HOST_POD_SWITCH(dest)][0]);  
+            dsttotor->push_back(topo[p]->pipes_ns_nlp[dest][topo_cfg->HOST_POD_SWITCH(dest)][0]);  
+            dsttotor->push_back(topo[p]->queues_ns_nlp[dest][topo_cfg->HOST_POD_SWITCH(dest)][0]->getRemoteEndpoint());  
+        
+            uec_src->connectPort(p, *srctotor, *dsttotor, *uec_snk, 0);  // start = 0  
+        
+            topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(src)]->addHostPort(src, uec_snk->flowId(), uec_src->getPort(p));  
+            topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(dest)]->addHostPort(dest, uec_src->flowId(), uec_snk->getPort(p));  
+        }  
+        
+        if (log_sink)        sink_logger->monitorSink(uec_snk);  
+        if (log_flow_events) uec_src->logFlowEvents(*event_logger);
+    }
 
-        assert(planes > 0);
-        simtime_picosec transmission_delay = (Packet::data_packet_size() * 8 / speedAsGbps(linkspeed) * topo_cfg->get_diameter() * 1000) 
-                                             + (UecBasePacket::get_ack_size() * 8 / speedAsGbps(linkspeed) * topo_cfg->get_diameter() * 1000);
-        simtime_picosec base_rtt_bw_two_points = 2*topo_cfg->get_two_point_diameter_latency(src, dest) + transmission_delay;
+    
 
-        //cout << "Connection " << crt->src << "->" <<crt->dst << " starting at " << crt->start << " size " << crt->size << endl;
+    exit(EXIT_FAILURE);
 
-        if (!conn_reuse 
-            || (crt->flowid and flowmap.find(crt->flowid) == flowmap.end())) {
-            unique_ptr<UecMultipath> mp = nullptr;
-            if (load_balancing_algo == BITMAP){
-                mp = make_unique<UecMpBitmap>(path_entropy_size, UecSrc::_debug);
-            } else if (load_balancing_algo == REPS){
-                mp = make_unique<UecMpReps>(path_entropy_size, UecSrc::_debug, !disable_trim);
-            } else if (load_balancing_algo == REPS_LEGACY){
-                mp = make_unique<UecMpRepsLegacy>(path_entropy_size, UecSrc::_debug);
-            }else if (load_balancing_algo == OBLIVIOUS){
-                mp = make_unique<UecMpOblivious>(path_entropy_size, UecSrc::_debug);
-            } else if (load_balancing_algo == MIXED){
-                mp = make_unique<UecMpMixed>(path_entropy_size, UecSrc::_debug);
-            } else {
-                cout << "ERROR: Failed to set multipath algorithm, abort." << endl;
-                abort();
+    if(sa){
+        for (size_t c = 0; c < all_conns->size(); c++){
+            connection* crt = all_conns->at(c);
+            int src = crt->src;
+            int dest = crt->dst;
+
+            if(src>range.fin  || src<range.init ) continue;
+            if(dest>range.fin || dest<range.init) continue;
+
+            int local_src  = src  - range.init;
+            int local_dest = dest - range.init;
+
+            bool foreign = ((dest > range.fin) || (dest < range.init));
+
+            int realDest = (foreign) ? dest : local_dest;
+
+            if (!conn_reuse and crt->msgid.has_value()) {
+                cout << "msg keyword can only be used when conn_reuse is enabled.\n";
+                exit(EXIT_FAILURE);
             }
 
-            uec_src = new UecSrc(traffic_logger, eventlist, move(mp), *nics.at(src), ports);
 
-            if (crt->flowid) {
-                uec_src->setFlowId(crt->flowid);
-                assert(flowmap.find(crt->flowid) == flowmap.end()); // don't have dups
-            }
 
-            if (conn_reuse) {
-                stringstream uec_src_dbg_tag;
-                uec_src_dbg_tag << "flow_id " << uec_src->flowId();
-                UecPdcSes* pdc = new UecPdcSes(uec_src, EventList::getTheEventList(), UecSrc::_mss, UecSrc::_hdr_size, uec_src_dbg_tag.str());
-                uec_src->makeReusable(pdc);
-                flow_pdc_map[uec_src->flowId()] = pdc;
-            }
-
-            if (receiver_driven)
-                uec_snk = new UecSink(NULL, pacers[dest].get(), *nics.at(dest),
-                                      ports);
-            else //each connection has its own pacer, so receiver driven mode does not kick in! 
-                uec_snk = new UecSink(NULL,linkspeed,1.1,UecBasePacket::unquantize(UecSink::_credit_per_pull),eventlist,*nics.at(dest), ports);
-
-            flowmap[uec_src->flowId()] = { uec_src, uec_snk };
-
-            if (crt->flowid) {
-                uec_snk->setFlowId(crt->flowid);
-            }
-
-            // If cwnd is 0 initXXcc will set a sensible default value 
-            if (receiver_driven) {
-                // uec_src->setCwnd(cwnd*Packet::data_packet_size());
-                // uec_src->setMaxWnd(cwnd*Packet::data_packet_size());
-
-                if (enable_accurate_base_rtt) {
-                    uec_src->initRccc(cwnd_b, base_rtt_bw_two_points);
-                } else {
-                    uec_src->initRccc(cwnd_b, network_max_unloaded_rtt);
-                }
-            }
-
-            if (sender_driven) {
-                if (enable_accurate_base_rtt) {
-                    uec_src->initNscc(cwnd_b, base_rtt_bw_two_points);
-                } else {
-                    uec_src->initNscc(cwnd_b, network_max_unloaded_rtt);
-                }
-            }
-            uec_srcs.push_back(uec_src);
-            uec_src->setDst(dest);
-
-            if (log_flow_events) {
-                uec_src->logFlowEvents(*event_logger);
-            }
+            assert(planes > 0);
+            simtime_picosec transmission_delay = (Packet::data_packet_size() * 8 / speedAsGbps(linkspeed) * topo_cfg->get_diameter() * 1000) 
+                                                + (UecBasePacket::get_ack_size() * 8 / speedAsGbps(linkspeed) * topo_cfg->get_diameter() * 1000);
+            simtime_picosec base_rtt_bw_two_points;
             
-
-            uec_src->setName("Uec_" + ntoa(src) + "_" + ntoa(dest));
-            logfile.writeName(*uec_src);
-            uec_snk->setSrc(src);
-
-            if (UecSink::_model_pcie){
-                uec_snk->setPCIeModel(pcie_models[dest]);
-            }
-                            
-            if (UecSink::_oversubscribed_cc){
-                uec_snk->setOversubscribedCC(oversubscribed_ccs[dest]);
+            if(foreign){
+                //todo...
+            }else{
+                simtime_picosec base_rtt_bw_two_points = 2*topo_cfg->get_two_point_diameter_latency(src, realDest) + transmission_delay;
             }
 
-            ((DataReceiver*)uec_snk)->setName("Uec_sink_" + ntoa(src) + "_" + ntoa(dest));
-            logfile.writeName(*(DataReceiver*)uec_snk);
+            cout << "Connection " << src << "->" << dest << " starting at " << crt->start << " size " << crt->size << endl;
 
-            if (!conn_reuse) {
-                if (crt->size>0){
-                    uec_src->setFlowsize(crt->size);
+            if (!conn_reuse 
+                || (crt->flowid and flowmap.find(crt->flowid) == flowmap.end())) {
+                unique_ptr<UecMultipath> mp = nullptr;
+                if (load_balancing_algo == BITMAP){
+                    mp = make_unique<UecMpBitmap>(path_entropy_size, UecSrc::_debug);
+                } else if (load_balancing_algo == REPS){
+                    mp = make_unique<UecMpReps>(path_entropy_size, UecSrc::_debug, !disable_trim);
+                } else if (load_balancing_algo == REPS_LEGACY){
+                    mp = make_unique<UecMpRepsLegacy>(path_entropy_size, UecSrc::_debug);
+                }else if (load_balancing_algo == OBLIVIOUS){
+                    mp = make_unique<UecMpOblivious>(path_entropy_size, UecSrc::_debug);
+                } else if (load_balancing_algo == MIXED){
+                    mp = make_unique<UecMpMixed>(path_entropy_size, UecSrc::_debug);
+                } else {
+                    cerr << "ERROR: Failed to set multipath algorithm, abort." << endl;
+                    exit(EXIT_FAILURE);
                 }
 
-                if (crt->trigger) {
-                    Trigger* trig = conns->getTrigger(crt->trigger, eventlist);
-                    trig->add_target(*uec_src);
+                uec_src = new UecSrc(traffic_logger, eventlist, move(mp), *nics.at(local_src), ports);
+
+                if (crt->flowid) {
+                    uec_src->setFlowId(crt->flowid);
+                    assert(flowmap.find(crt->flowid) == flowmap.end()); // don't have dups
                 }
 
-                if (crt->send_done_trigger) {
-                    Trigger* trig = conns->getTrigger(crt->send_done_trigger, eventlist);
-                    uec_src->setEndTrigger(*trig);
+                if (conn_reuse) {
+                    stringstream uec_src_dbg_tag;
+                    uec_src_dbg_tag << "flow_id " << uec_src->flowId();
+                    UecPdcSes* pdc = new UecPdcSes(uec_src, EventList::getTheEventList(), UecSrc::_mss, UecSrc::_hdr_size, uec_src_dbg_tag.str());
+                    uec_src->makeReusable(pdc);
+                    flow_pdc_map[uec_src->flowId()] = pdc;
                 }
 
-                if (crt->recv_done_trigger) {
-                    Trigger* trig = conns->getTrigger(crt->recv_done_trigger, eventlist);
-                    uec_snk->setEndTrigger(*trig);
+                if (receiver_driven){
+                    if(foreign){
+
+                    }else{
+                        uec_snk = new UecSink(NULL, pacers[realDest].get(), *nics.at(realDest), ports);
+                    }
+                }else{ //each connection has its own pacer, so receiver driven mode does not kick in! 
+                    if(foreign){
+
+                    }else{
+                        uec_snk = new UecSink(NULL, linkspeed, 1.1, UecBasePacket::unquantize(UecSink::_credit_per_pull), eventlist, *nics.at(realDest), ports);
+                    }
+                }
+                flowmap[uec_src->flowId()] = { uec_src, uec_snk };
+
+                if (crt->flowid) {
+                    uec_snk->setFlowId(crt->flowid);
+                }
+
+                // If cwnd is 0 initXXcc will set a sensible default value 
+                if (receiver_driven) {
+                    // uec_src->setCwnd(cwnd*Packet::data_packet_size());
+                    // uec_src->setMaxWnd(cwnd*Packet::data_packet_size());
+
+                    if (enable_accurate_base_rtt) {
+                        uec_src->initRccc(cwnd_b, base_rtt_bw_two_points);
+                    } else {
+                        uec_src->initRccc(cwnd_b, network_max_unloaded_rtt);
+                    }
+                }
+
+                if (sender_driven) {
+                    if (enable_accurate_base_rtt) {
+                        uec_src->initNscc(cwnd_b, base_rtt_bw_two_points);
+                    } else {
+                        uec_src->initNscc(cwnd_b, network_max_unloaded_rtt);
+                    }
+                }
+                uec_srcs.push_back(uec_src);
+                uec_src->setDst(realDest);
+
+                if (log_flow_events) {
+                    uec_src->logFlowEvents(*event_logger);
+                }
+                
+
+                uec_src->setName("Uec_" + ntoa(src) + "_" + ntoa(realDest));
+                logfile.writeName(*uec_src);
+                uec_snk->setSrc(src);
+
+                if (UecSink::_model_pcie){
+                    uec_snk->setPCIeModel(pcie_models[realDest]);
+                }
+                                
+                if (UecSink::_oversubscribed_cc){
+                    uec_snk->setOversubscribedCC(oversubscribed_ccs[realDest]);
+                }
+
+                ((DataReceiver*)uec_snk)->setName("Uec_sink_" + ntoa(src) + "_" + ntoa(realDest));
+                logfile.writeName(*(DataReceiver*)uec_snk);
+
+                if (!conn_reuse) {
+                    if (crt->size>0){
+                        uec_src->setFlowsize(crt->size);
+                    }
+
+                    if (crt->trigger) {
+                        Trigger* trig = conns->getTrigger(crt->trigger, eventlist);
+                        trig->add_target(*uec_src);
+                    }
+
+                    if (crt->send_done_trigger) {
+                        Trigger* trig = conns->getTrigger(crt->send_done_trigger, eventlist);
+                        uec_src->setEndTrigger(*trig);
+                    }
+
+                    if (crt->recv_done_trigger) {
+                        Trigger* trig = conns->getTrigger(crt->recv_done_trigger, eventlist);
+                        uec_snk->setEndTrigger(*trig);
+                    }
+                } else {
+                    assert(crt->size > 0);
+
+                    optional<simtime_picosec> start_ts = {};
+                    if (crt->start != TRIGGER_START) {
+                        start_ts.emplace(timeFromUs((uint32_t)crt->start));
+                    } 
+
+                    UecPdcSes* pdc = flow_pdc_map.find(crt->flowid)->second;
+                    UecMsg* msg = pdc->enque(crt->size, start_ts, true);
+
+                    if (crt->trigger) {
+                        Trigger* trig = conns->getTrigger(crt->trigger, eventlist);
+                        trig->add_target(*msg);
+                    }
+
+                    if (crt->send_done_trigger) {
+                        Trigger* trig = conns->getTrigger(crt->send_done_trigger, eventlist);
+                        msg->setTrigger(UecMsg::MsgStatus::SentLast, trig);
+                    }
+
+                    if (crt->recv_done_trigger) {
+                        Trigger* trig = conns->getTrigger(crt->recv_done_trigger, eventlist);
+                        uec_snk->setEndTrigger(*trig);
+                        msg->setTrigger(UecMsg::MsgStatus::RecvdLast, trig);
+                    }
+                }
+
+                //uec_snk->set_priority(crt->priority);
+                                
+                for (uint32_t p = 0; p < planes; p++) {
+                    switch (route_strategy) {
+                    case ECMP_FIB:
+                    case ECMP_FIB_ECN:
+                    case REACTIVE_ECN:
+                        {
+                            Route* srctotor = new Route();
+                            srctotor->push_back(topo[p]->queues_ns_nlp[local_src][topo_cfg->HOST_POD_SWITCH(local_src)][0]);
+                            srctotor->push_back(topo[p]->pipes_ns_nlp[local_src][topo_cfg->HOST_POD_SWITCH(local_src)][0]);
+                            srctotor->push_back(topo[p]->queues_ns_nlp[local_src][topo_cfg->HOST_POD_SWITCH(local_src)][0]->getRemoteEndpoint());
+
+                            Route* dsttotor = new Route();
+                            dsttotor->push_back(topo[p]->queues_ns_nlp[realDest][topo_cfg->HOST_POD_SWITCH(realDest)][0]);
+                            dsttotor->push_back(topo[p]->pipes_ns_nlp[realDest][topo_cfg->HOST_POD_SWITCH(realDest)][0]);
+                            dsttotor->push_back(topo[p]->queues_ns_nlp[realDest][topo_cfg->HOST_POD_SWITCH(realDest)][0]->getRemoteEndpoint());
+
+                            uec_src->connectPort(p, *srctotor, *dsttotor, *uec_snk, crt->start);
+                            //uec_src->setPaths(path_entropy_size);
+                            //uec_snk->setPaths(path_entropy_size);
+
+                            //register src and snk to receive packets from their respective TORs. 
+                            assert(topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(local_src)]);
+                            assert(topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(local_src)]);
+                            topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(local_src)]->addHostPort(local_src,uec_snk->flowId(),uec_src->getPort(p));
+                            topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(realDest)]->addHostPort(realDest,uec_src->flowId(),uec_snk->getPort(p));
+                            break;
+                        }
+                    default:
+                        exit(EXIT_FAILURE);
+                    }
+                }
+
+                // set up the triggers
+                // xxx
+
+                if (log_sink) {
+                    sink_logger->monitorSink(uec_snk);
                 }
             } else {
-                assert(crt->size > 0);
+                // Use existing connection for this message
+                assert(crt->msgid.has_value());
+
+                UecPdcSes* pdc = flow_pdc_map.find(crt->flowid)->second;
+                uec_src = nullptr;
+                uec_snk = nullptr;
 
                 optional<simtime_picosec> start_ts = {};
                 if (crt->start != TRIGGER_START) {
                     start_ts.emplace(timeFromUs((uint32_t)crt->start));
                 } 
 
-                UecPdcSes* pdc = flow_pdc_map.find(crt->flowid)->second;
                 UecMsg* msg = pdc->enque(crt->size, start_ts, true);
 
                 if (crt->trigger) {
@@ -1063,83 +2254,238 @@ int main(int argc, char **argv) {
 
                 if (crt->recv_done_trigger) {
                     Trigger* trig = conns->getTrigger(crt->recv_done_trigger, eventlist);
-                    uec_snk->setEndTrigger(*trig);
                     msg->setTrigger(UecMsg::MsgStatus::RecvdLast, trig);
                 }
             }
+        }
 
-            //uec_snk->set_priority(crt->priority);
-                            
-            for (uint32_t p = 0; p < planes; p++) {
-                switch (route_strategy) {
-                case ECMP_FIB:
-                case ECMP_FIB_ECN:
-                case REACTIVE_ECN:
-                    {
-                        Route* srctotor = new Route();
-                        srctotor->push_back(topo[p]->queues_ns_nlp[src][topo_cfg->HOST_POD_SWITCH(src)][0]);
-                        srctotor->push_back(topo[p]->pipes_ns_nlp[src][topo_cfg->HOST_POD_SWITCH(src)][0]);
-                        srctotor->push_back(topo[p]->queues_ns_nlp[src][topo_cfg->HOST_POD_SWITCH(src)][0]->getRemoteEndpoint());
+    }else{
+        for (size_t c = 0; c < all_conns->size(); c++){
+            connection* crt = all_conns->at(c);
+            int src = crt->src;
+            int dest = crt->dst;
 
-                        Route* dsttotor = new Route();
-                        dsttotor->push_back(topo[p]->queues_ns_nlp[dest][topo_cfg->HOST_POD_SWITCH(dest)][0]);
-                        dsttotor->push_back(topo[p]->pipes_ns_nlp[dest][topo_cfg->HOST_POD_SWITCH(dest)][0]);
-                        dsttotor->push_back(topo[p]->queues_ns_nlp[dest][topo_cfg->HOST_POD_SWITCH(dest)][0]->getRemoteEndpoint());
+            if (!conn_reuse and crt->msgid.has_value()) {
+                cout << "msg keyword can only be used when conn_reuse is enabled.\n";
+                abort();
+            }
 
-                        uec_src->connectPort(p, *srctotor, *dsttotor, *uec_snk, crt->start);
-                        //uec_src->setPaths(path_entropy_size);
-                        //uec_snk->setPaths(path_entropy_size);
+            assert(planes > 0);
+            simtime_picosec transmission_delay = (Packet::data_packet_size() * 8 / speedAsGbps(linkspeed) * topo_cfg->get_diameter() * 1000) 
+                                                + (UecBasePacket::get_ack_size() * 8 / speedAsGbps(linkspeed) * topo_cfg->get_diameter() * 1000);
+            simtime_picosec base_rtt_bw_two_points = 2*topo_cfg->get_two_point_diameter_latency(src, dest) + transmission_delay;
 
-                        //register src and snk to receive packets from their respective TORs. 
-                        assert(topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(src)]);
-                        assert(topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(src)]);
-                        topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(src)]->addHostPort(src,uec_snk->flowId(),uec_src->getPort(p));
-                        topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(dest)]->addHostPort(dest,uec_src->flowId(),uec_snk->getPort(p));
-                        break;
-                    }
-                default:
+            //cout << "Connection " << crt->src << "->" <<crt->dst << " starting at " << crt->start << " size " << crt->size << endl;
+
+            if (!conn_reuse 
+                || (crt->flowid and flowmap.find(crt->flowid) == flowmap.end())) {
+                unique_ptr<UecMultipath> mp = nullptr;
+                if (load_balancing_algo == BITMAP){
+                    mp = make_unique<UecMpBitmap>(path_entropy_size, UecSrc::_debug);
+                } else if (load_balancing_algo == REPS){
+                    mp = make_unique<UecMpReps>(path_entropy_size, UecSrc::_debug, !disable_trim);
+                } else if (load_balancing_algo == REPS_LEGACY){
+                    mp = make_unique<UecMpRepsLegacy>(path_entropy_size, UecSrc::_debug);
+                }else if (load_balancing_algo == OBLIVIOUS){
+                    mp = make_unique<UecMpOblivious>(path_entropy_size, UecSrc::_debug);
+                } else if (load_balancing_algo == MIXED){
+                    mp = make_unique<UecMpMixed>(path_entropy_size, UecSrc::_debug);
+                } else {
+                    cout << "ERROR: Failed to set multipath algorithm, abort." << endl;
                     abort();
                 }
-            }
 
-            // set up the triggers
-            // xxx
+                uec_src = new UecSrc(traffic_logger, eventlist, move(mp), *nics.at(src), ports);
 
-            if (log_sink) {
-                sink_logger->monitorSink(uec_snk);
-            }
-        } else {
-            // Use existing connection for this message
-            assert(crt->msgid.has_value());
+                if (crt->flowid) {
+                    uec_src->setFlowId(crt->flowid);
+                    assert(flowmap.find(crt->flowid) == flowmap.end()); // don't have dups
+                }
 
-            UecPdcSes* pdc = flow_pdc_map.find(crt->flowid)->second;
-            uec_src = nullptr;
-            uec_snk = nullptr;
+                if (conn_reuse) {
+                    stringstream uec_src_dbg_tag;
+                    uec_src_dbg_tag << "flow_id " << uec_src->flowId();
+                    UecPdcSes* pdc = new UecPdcSes(uec_src, EventList::getTheEventList(), UecSrc::_mss, UecSrc::_hdr_size, uec_src_dbg_tag.str());
+                    uec_src->makeReusable(pdc);
+                    flow_pdc_map[uec_src->flowId()] = pdc;
+                }
 
-            optional<simtime_picosec> start_ts = {};
-            if (crt->start != TRIGGER_START) {
-                start_ts.emplace(timeFromUs((uint32_t)crt->start));
-            } 
+                if (receiver_driven)
+                    uec_snk = new UecSink(NULL, pacers[dest].get(), *nics.at(dest),
+                                        ports);
+                else //each connection has its own pacer, so receiver driven mode does not kick in! 
+                    uec_snk = new UecSink(NULL,linkspeed,1.1,UecBasePacket::unquantize(UecSink::_credit_per_pull),eventlist,*nics.at(dest), ports);
 
-            UecMsg* msg = pdc->enque(crt->size, start_ts, true);
+                flowmap[uec_src->flowId()] = { uec_src, uec_snk };
 
-            if (crt->trigger) {
-                Trigger* trig = conns->getTrigger(crt->trigger, eventlist);
-                trig->add_target(*msg);
-            }
+                if (crt->flowid) {
+                    uec_snk->setFlowId(crt->flowid);
+                }
 
-            if (crt->send_done_trigger) {
-                Trigger* trig = conns->getTrigger(crt->send_done_trigger, eventlist);
-                msg->setTrigger(UecMsg::MsgStatus::SentLast, trig);
-            }
+                // If cwnd is 0 initXXcc will set a sensible default value 
+                if (receiver_driven) {
+                    // uec_src->setCwnd(cwnd*Packet::data_packet_size());
+                    // uec_src->setMaxWnd(cwnd*Packet::data_packet_size());
 
-            if (crt->recv_done_trigger) {
-                Trigger* trig = conns->getTrigger(crt->recv_done_trigger, eventlist);
-                msg->setTrigger(UecMsg::MsgStatus::RecvdLast, trig);
+                    if (enable_accurate_base_rtt) {
+                        uec_src->initRccc(cwnd_b, base_rtt_bw_two_points);
+                    } else {
+                        uec_src->initRccc(cwnd_b, network_max_unloaded_rtt);
+                    }
+                }
+
+                if (sender_driven) {
+                    if (enable_accurate_base_rtt) {
+                        uec_src->initNscc(cwnd_b, base_rtt_bw_two_points);
+                    } else {
+                        uec_src->initNscc(cwnd_b, network_max_unloaded_rtt);
+                    }
+                }
+                uec_srcs.push_back(uec_src);
+                uec_src->setDst(dest);
+
+                if (log_flow_events) {
+                    uec_src->logFlowEvents(*event_logger);
+                }
+                
+
+                uec_src->setName("Uec_" + ntoa(src) + "_" + ntoa(dest));
+                logfile.writeName(*uec_src);
+                uec_snk->setSrc(src);
+
+                if (UecSink::_model_pcie){
+                    uec_snk->setPCIeModel(pcie_models[dest]);
+                }
+                                
+                if (UecSink::_oversubscribed_cc){
+                    uec_snk->setOversubscribedCC(oversubscribed_ccs[dest]);
+                }
+
+                ((DataReceiver*)uec_snk)->setName("Uec_sink_" + ntoa(src) + "_" + ntoa(dest));
+                logfile.writeName(*(DataReceiver*)uec_snk);
+
+                if (!conn_reuse) {
+                    if (crt->size>0){
+                        uec_src->setFlowsize(crt->size);
+                    }
+
+                    if (crt->trigger) {
+                        Trigger* trig = conns->getTrigger(crt->trigger, eventlist);
+                        trig->add_target(*uec_src);
+                    }
+
+                    if (crt->send_done_trigger) {
+                        Trigger* trig = conns->getTrigger(crt->send_done_trigger, eventlist);
+                        uec_src->setEndTrigger(*trig);
+                    }
+
+                    if (crt->recv_done_trigger) {
+                        Trigger* trig = conns->getTrigger(crt->recv_done_trigger, eventlist);
+                        uec_snk->setEndTrigger(*trig);
+                    }
+                } else {
+                    assert(crt->size > 0);
+
+                    optional<simtime_picosec> start_ts = {};
+                    if (crt->start != TRIGGER_START) {
+                        start_ts.emplace(timeFromUs((uint32_t)crt->start));
+                    } 
+
+                    UecPdcSes* pdc = flow_pdc_map.find(crt->flowid)->second;
+                    UecMsg* msg = pdc->enque(crt->size, start_ts, true);
+
+                    if (crt->trigger) {
+                        Trigger* trig = conns->getTrigger(crt->trigger, eventlist);
+                        trig->add_target(*msg);
+                    }
+
+                    if (crt->send_done_trigger) {
+                        Trigger* trig = conns->getTrigger(crt->send_done_trigger, eventlist);
+                        msg->setTrigger(UecMsg::MsgStatus::SentLast, trig);
+                    }
+
+                    if (crt->recv_done_trigger) {
+                        Trigger* trig = conns->getTrigger(crt->recv_done_trigger, eventlist);
+                        uec_snk->setEndTrigger(*trig);
+                        msg->setTrigger(UecMsg::MsgStatus::RecvdLast, trig);
+                    }
+                }
+
+                //uec_snk->set_priority(crt->priority);
+                                
+                for (uint32_t p = 0; p < planes; p++) {
+                    switch (route_strategy) {
+                    case ECMP_FIB:
+                    case ECMP_FIB_ECN:
+                    case REACTIVE_ECN:
+                        {
+                            Route* srctotor = new Route();
+                            srctotor->push_back(topo[p]->queues_ns_nlp[src][topo_cfg->HOST_POD_SWITCH(src)][0]);
+                            srctotor->push_back(topo[p]->pipes_ns_nlp[src][topo_cfg->HOST_POD_SWITCH(src)][0]);
+                            srctotor->push_back(topo[p]->queues_ns_nlp[src][topo_cfg->HOST_POD_SWITCH(src)][0]->getRemoteEndpoint());
+
+                            Route* dsttotor = new Route();
+                            dsttotor->push_back(topo[p]->queues_ns_nlp[dest][topo_cfg->HOST_POD_SWITCH(dest)][0]);
+                            dsttotor->push_back(topo[p]->pipes_ns_nlp[dest][topo_cfg->HOST_POD_SWITCH(dest)][0]);
+                            dsttotor->push_back(topo[p]->queues_ns_nlp[dest][topo_cfg->HOST_POD_SWITCH(dest)][0]->getRemoteEndpoint());
+
+                            uec_src->connectPort(p, *srctotor, *dsttotor, *uec_snk, crt->start);
+                            //uec_src->setPaths(path_entropy_size);
+                            //uec_snk->setPaths(path_entropy_size);
+
+                            //register src and snk to receive packets from their respective TORs. 
+                            assert(topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(src)]);
+                            assert(topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(src)]);
+                            topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(src)]->addHostPort(src,uec_snk->flowId(),uec_src->getPort(p));
+                            topo[p]->switches_lp[topo_cfg->HOST_POD_SWITCH(dest)]->addHostPort(dest,uec_src->flowId(),uec_snk->getPort(p));
+                            break;
+                        }
+                    default:
+                        abort();
+                    }
+                }
+
+                // set up the triggers
+                // xxx
+
+                if (log_sink) {
+                    sink_logger->monitorSink(uec_snk);
+                }
+            } else {
+                // Use existing connection for this message
+                assert(crt->msgid.has_value());
+
+                UecPdcSes* pdc = flow_pdc_map.find(crt->flowid)->second;
+                uec_src = nullptr;
+                uec_snk = nullptr;
+
+                optional<simtime_picosec> start_ts = {};
+                if (crt->start != TRIGGER_START) {
+                    start_ts.emplace(timeFromUs((uint32_t)crt->start));
+                } 
+
+                UecMsg* msg = pdc->enque(crt->size, start_ts, true);
+
+                if (crt->trigger) {
+                    Trigger* trig = conns->getTrigger(crt->trigger, eventlist);
+                    trig->add_target(*msg);
+                }
+
+                if (crt->send_done_trigger) {
+                    Trigger* trig = conns->getTrigger(crt->send_done_trigger, eventlist);
+                    msg->setTrigger(UecMsg::MsgStatus::SentLast, trig);
+                }
+
+                if (crt->recv_done_trigger) {
+                    Trigger* trig = conns->getTrigger(crt->recv_done_trigger, eventlist);
+                    msg->setTrigger(UecMsg::MsgStatus::RecvdLast, trig);
+                }
             }
         }
+
     }
 
+    
     Logged::dump_idmap();
     // Record the setup
     int pktsize = Packet::data_packet_size();
@@ -1149,11 +2495,77 @@ int main(int argc, char **argv) {
     //logfile.write("# buffer = " + ntoa((double) (queues_na_ni[0][1]->_maxsize) / ((double) pktsize)) + " pkt");
     
     // GO!
-    cout << "Starting simulation" << endl;
-    while (eventlist.doNextEvent()) {
+    if(sa){
+        //sync all child TEMP
+        raise(SIGSTOP);
+
+        //initial updating of guide
+        EventHeaderUpdater update;
+        update.child_id = process;
+
+        strcpy(update.message, "INIT");
+        update.next_event_time = eventlist.peekNextEventTime();
+
+        socket.send(zmq::buffer(&update, sizeof(update)), zmq::send_flags::none);
+
+        //GO!
+        cout<<"Ready to simulate... waiting GUIDE"<<endl;
+        EventTimeLimit arg;
+        do{
+            socket.recv(resp, zmq::recv_flags::none);
+            
+            if(resp.size() != sizeof(EventTimeLimit)){
+                cerr<<"Unaspected response, shutting down..."<<endl;
+                exit(EXIT_FAILURE);
+            }
+            
+            memcpy(&arg, resp.data(), sizeof(EventTimeLimit));
+
+            if(strcmp(arg.message, "STOP") == 0) break;
+            if(strcmp(arg.message, "NOLIMIT") == 0){
+                //cout<<"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANOLIMIT"<<endl;
+                while(!eventlist.isEmpty()){
+                    eventlist.doNextEvent();
+                }
+                
+            }else if(strcmp(arg.message, "GO") == 0){
+                if(arg.time_limit < eventlist.now()){
+                    cerr<<"Incongrous time detected, shutting down..."<<endl;
+                    exit(EXIT_FAILURE);
+                }
+
+                //cout<<"Simulating until "<<timeAsUs(arg.time_limit)<<endl;
+                while(eventlist.peekNextEventTime() <= arg.time_limit && !eventlist.isEmpty()){
+                    eventlist.doNextEvent();
+                }
+
+            }else{
+                cerr<<"Unaspected response, shutting down..."<<endl;
+                exit(EXIT_FAILURE);
+            }
+
+            if(!eventlist.isEmpty()){
+                strcpy(update.message, "UPDATE");
+                update.next_event_time = eventlist.peekNextEventTime();
+            }else{
+                //cout<<"DONEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE"<<endl;
+                strcpy(update.message, "DONE");
+                update.next_event_time = 0;
+            }
+
+            socket.send(zmq::buffer(&update, sizeof(update)), zmq::send_flags::none);
+
+        }while(true);
+
+        cout<<"Simulation ended"<<endl;
+    }else{
+        cout << "Starting simulation" << endl;
+
+        while (eventlist.doNextEvent()) {}
+        cout << "Done" << endl;
     }
 
-    cout << "Done" << endl;
+
     int new_pkts = 0, rtx_pkts = 0, bounce_pkts = 0, rts_pkts = 0, ack_pkts = 0, nack_pkts = 0, pull_pkts = 0, sleek_pkts = 0;
     for (size_t ix = 0; ix < uec_srcs.size(); ix++) {
         const struct UecSrc::Stats& s = uec_srcs[ix]->stats();

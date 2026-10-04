@@ -42,6 +42,7 @@ struct failure {
     FatTreeSwitch::switch_type switch_type;
     uint32_t switch_id;
     uint32_t link_id;
+    uint32_t dc;
 };
 
 
@@ -70,10 +71,14 @@ public:
 
     bool save(const char * filename);
     bool save(FILE*);
-    bool load(const char * filename);  
-    /*bool load(FILE*);*/
+    bool load(const char * filename);
     bool load(istream& file);
-  
+
+    //scale across
+    bool load(const char * filename, int bot, int top);
+    bool loadSa(istream& file, int bot, int top);
+    
+    static int getNumNode(istream& file);
     vector<connection*>* getAllConnections();
     Trigger* getTrigger(triggerid_t id, EventList& eventlist);
     void bindTriggers(connection* c, EventList& eventlist);

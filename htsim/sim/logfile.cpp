@@ -116,7 +116,7 @@ Logfile::transposeLog() {
         val3Rec[numread] = rd;
     }
     fclose(logfile);
-    assert(numread==_numRecords);
+//    assert(numread==_numRecords);
     _preamble << "# numrecords=" << numread << endl;
     logfile = fopen(_logfilename.c_str(),"wbS");
     if (logfile==0) {

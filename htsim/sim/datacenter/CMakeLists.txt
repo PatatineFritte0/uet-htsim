@@ -1,3 +1,5 @@
+find_package(cppzmq REQUIRED)
+
 # List of common source files shared among executables.
 set(LIB_SOURCES
     firstfit.cpp
@@ -18,6 +20,8 @@ set(LIB_SOURCES
 add_library(htsim_dc STATIC ${LIB_SOURCES})
 target_include_directories(htsim_dc PUBLIC ${PROJECT_SOURCE_DIR}) 
 target_include_directories(htsim_dc PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}) 
+
+target_link_libraries(htsim_dc PUBLIC cppzmq)
 
 # -------------------------------
 # Executable Definitions

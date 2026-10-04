@@ -40,6 +40,8 @@ public:
     static void reschedulePendingSource(EventSource &src, simtime_picosec when);
     static void triggerIsPending(TriggerTarget &target);
     static inline simtime_picosec now() {return EventList::_lasteventtime;}
+    static simtime_picosec peekNextEventTime() { return _pendingsources.empty() ? _lasteventtime : _pendingsources.begin()->first; }
+    static bool isEmpty() { return _pendingsources.empty() && _pending_triggers.empty(); }
     static inline int trafficEventCount() {return EventList::_trafficeventcount;}
     static Handle nullHandle() {return _pendingsources.end();}
 
