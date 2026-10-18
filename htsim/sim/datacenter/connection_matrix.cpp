@@ -887,7 +887,7 @@ bool ConnectionMatrix::loadSa(istream& file, int bot, int top){
             assert (failures.size()<failures_size);
 
             failure *f = new failure;
-
+            f->dc = -1;
             for (size_t i = 1; i < tokens.size(); i++) {
                 if (tokens[i] == "switch_type") {
                     i++;
@@ -914,6 +914,11 @@ bool ConnectionMatrix::loadSa(istream& file, int bot, int top){
                     cerr << "Error: unknown failure attribute " << tokens[i] << " at line " << linecount << endl;
                     exit(EXIT_FAILURE);
                 }
+            
+            }
+            if(f->dc == -1){
+                cerr<<"in a Scale Across simulation the failure must be specified the dc id, err line: "<<linecount<<endl;
+                exit(EXIT_FAILURE);
             }
             failures.push_back(f);
         } else {

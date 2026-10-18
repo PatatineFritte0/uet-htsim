@@ -172,6 +172,7 @@ public:
     inline bool is_rnr() const {return _rnr;}
     inline bool is_slow_pull() const {return _slow_pull;}
     inline void set_slow_pull(bool sp) {_slow_pull = sp;}
+    uint32_t pathid() const {return _pathid;}
 
     virtual PktPriority priority() const {return Packet::PRIO_HI;}
   

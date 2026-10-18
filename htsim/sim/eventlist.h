@@ -44,7 +44,10 @@ public:
     static bool isEmpty() { return _pendingsources.empty() && _pending_triggers.empty(); }
     static inline int trafficEventCount() {return EventList::_trafficeventcount;}
     static Handle nullHandle() {return _pendingsources.end();}
-
+    
+    bool isStopped(){return _stop;}
+    void stop() {_stop = true;}
+    void go() {_stop = false;}
 
     static EventList& getTheEventList();
     EventList(const EventList&)      = delete;  // disable Copy Constructor
@@ -60,6 +63,7 @@ private:
     static int _instanceCount;
     static int _trafficeventcount; // number of events that are not loggers/samplers
     static EventList* _theEventList;
+    bool _stop;
 };
 
 #endif

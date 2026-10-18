@@ -106,7 +106,9 @@ FatTreeTopologyCfg::FatTreeTopologyCfg(queue_type q, queue_type snd):
                         _hop_latency(0),
                         _switch_latency(0),
                         _diameter_latency(0),
-                        _diameter(0)
+                        _diameter(0),
+                        _range_init(0),
+                        _range_fin(-1)
                         {
 
 }

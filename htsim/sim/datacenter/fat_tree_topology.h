@@ -92,6 +92,8 @@ public:
     void set_params(uint32_t no_of_nodes);
     void set_custom_params(uint32_t no_of_nodes);
 
+    void set_range(uint32_t init, uint32_t fin){_range_init = init; _range_fin = fin;}
+
     uint32_t HOST_POD_SWITCH(uint32_t src) const {
         return src/_radix_down[TOR_TIER];
     }
@@ -158,6 +160,13 @@ public:
     uint32_t queue_up(int tier) const {return _queue_up[tier];}
     uint32_t queue_down(int tier) const {return _queue_down[tier];}
 
+    bool isInRange(uint32_t node, bool bypass = false) const { return (bypass || _range_fin == -1 || (node >= _range_init && node <= _range_fin));}
+
+    long int getInitRange() const { return _range_init;}
+    long int getFinRange() const { return _range_fin;}
+    long int getLocalNode(uint32_t node) const { return node - _range_init;}
+    long int getGlobalNode(uint32_t node) const { return node + _range_init;}
+
     int get_oversubscription_ratio(){int ratio = _oversub[TOR_TIER]; if (_tiers>2) ratio *= _oversub[AGG_TIER]; return ratio;}
     simtime_picosec get_diameter_latency() {return _diameter_latency;}
     simtime_picosec get_two_point_diameter_latency(int src, int dst);
@@ -223,10 +232,14 @@ private:
     double _failed_link_ratio;
 
     uint32_t _no_of_nodes;
+    long int _range_init;
+    long int _range_fin;
+
     simtime_picosec _hop_latency,_switch_latency;
 
     simtime_picosec _diameter_latency;
     uint16_t _diameter;
+
 };
 
 template<class P> void delete_3d_vector(vector<vector<vector<P*>>>& vec3d);

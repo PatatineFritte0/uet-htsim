@@ -42,7 +42,7 @@ struct failure {
     FatTreeSwitch::switch_type switch_type;
     uint32_t switch_id;
     uint32_t link_id;
-    uint32_t dc;
+    int dc;
 };
 
 

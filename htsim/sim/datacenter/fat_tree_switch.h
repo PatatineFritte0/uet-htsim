@@ -100,6 +100,7 @@ public:
   
     virtual void receivePacket(Packet& pkt);
     virtual Route* getNextHop(Packet& pkt, BaseQueue* ingress_port);
+    Route* getNextHopImpl(Packet& pkt, BaseQueue* ingress_port, uint32_t originalDest, uint32_t fibKey);
     virtual uint32_t getType() {return _type;}
 
     uint32_t adaptive_route(vector<FibEntry*>* ecmp_set, int8_t (*cmp)(FibEntry*,FibEntry*));
@@ -123,6 +124,15 @@ public:
 
     static void set_strategy(routing_strategy s) { assert (_strategy==NIX); _strategy = s; }
     static void set_ar_fraction(uint16_t f) { assert(f>=1);_ar_fraction = f;} 
+    void setTapRoute(BaseQueue* q, Pipe* p) {  
+        _tap_pipe = p;
+        _tap_port = q;
+        _tap_route = new Route();  
+        _tap_route->push_back(q);  
+        _tap_route->push_back(p);  
+        _tap_route->push_back(q->getRemoteEndpoint());  
+    }
+
 
     static routing_strategy _strategy;
     static uint16_t _ar_fraction;
@@ -132,6 +142,7 @@ public:
     static double _speculative_threshold_fraction;
     static uint16_t _trim_size;
     static bool _disable_trim;
+    static uint32_t _nodeOffSet;
 private:
     switch_type _type;
     Pipe* _pipe;
@@ -149,6 +160,10 @@ private:
     simtime_picosec _last_choice;
 
     unordered_map<Packet*,bool> _packets;
+
+    BaseQueue* _tap_port;
+    Pipe* _tap_pipe;
+    Route* _tap_route;
 };
 
 #endif
