@@ -1,3 +1,6 @@
-Nodes 270
-Connections 1
-0->16 id 1 start 0 size 2000000
+Nodes 32
+Connections 2
+Triggers 1
+4->16 id 2 size 2000000 start 0 send_done_trigger 1
+16->4 id 4 size 2000000 trigger 1
+trigger id 1 oneshot

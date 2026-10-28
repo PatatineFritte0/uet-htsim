@@ -10,8 +10,7 @@ Clock::Clock(simtime_picosec period, EventList& eventlist)
     eventlist.sourceIsPendingRel(*this, period);
 }
 
-void
-Clock::doNextEvent() {
+void Clock::doNextEvent(){
     eventlist().sourceIsPendingRel(*this, _period);
     if (_smallticks<10) {
         cout << '.' << flush;

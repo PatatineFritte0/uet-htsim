@@ -49,6 +49,11 @@ public:
     void stop() {_stop = true;}
     void go() {_stop = false;}
 
+    void trigghered(uint32_t id){_triggId = id;}
+    void resetTrigg() {_triggId = 0;}
+    uint32_t getTriggherId() {return _triggId;}
+
+
     static EventList& getTheEventList();
     EventList(const EventList&)      = delete;  // disable Copy Constructor
     void operator=(const EventList&) = delete;  // disable Assign Constructor
@@ -64,6 +69,7 @@ private:
     static int _trafficeventcount; // number of events that are not loggers/samplers
     static EventList* _theEventList;
     bool _stop;
+    uint32_t _triggId;
 };
 
 #endif

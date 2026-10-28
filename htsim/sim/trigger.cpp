@@ -21,12 +21,14 @@ SingleShotTrigger::SingleShotTrigger(EventList& eventlist, triggerid_t id)
 void
 SingleShotTrigger::activate() {
     assert(!_done);
-    assert(_targets.size() > 0);
-    vector <TriggerTarget*>::iterator i;
-    cout << "Trigger " << _id << " fired, " << _targets.size() << " targets\n";
-    for (i = _targets.begin(); i != _targets.end(); i++) {
-        _eventlist.triggerIsPending(**i);
+    if(_targets.size() > 0){
+        vector <TriggerTarget*>::iterator i;
+        cout << "Trigger " << _id << " fired, " << _targets.size() << " targets\n";
+        for (i = _targets.begin(); i != _targets.end(); i++) {
+            _eventlist.triggerIsPending(**i);
+        }
     }
+    //assert(_targets.size() > 0);
     _done = true;
 }
 

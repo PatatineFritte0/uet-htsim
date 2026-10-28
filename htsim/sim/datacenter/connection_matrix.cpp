@@ -755,6 +755,9 @@ bool ConnectionMatrix::loadSa(istream& file, int bot, int top){
             c->trigger = 0;
             c->src = stoi(tokens[0]);
             c->dst = stoi(tokens[0].substr(dstix));
+            bool srcIn = (c->src >= bot && c->src <= top);
+            bool dstIn = (c->dst >= bot && c->dst <= top);
+            if(!(srcIn || dstIn)) continue;
             c->priority = 2000000;
             c->start = NO_START;
             for (size_t i = 1; i < tokens.size(); i++) {

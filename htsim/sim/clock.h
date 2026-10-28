@@ -17,6 +17,6 @@ public:
 private:
         simtime_picosec _period;
         int _smallticks;
-        };
+};
 
 #endif

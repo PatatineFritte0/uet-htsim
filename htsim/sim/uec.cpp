@@ -858,6 +858,8 @@ bool UecSrc::checkFinished(UecDataPacket::seq_t cum_ack) {
                 _speculating = false;
                 if (_end_trigger) {
                     _end_trigger->activate();
+                    _eventlist.trigghered(_end_trigger->get_id());
+                    _eventlist.stop();
                 }
                 if (_flow_logger) {
                     _flow_logger->logEvent(_flow, *this, FlowEventLogger::FINISH, _flow_size, cum_ack);
